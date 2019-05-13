@@ -1,0 +1,426 @@
+---
+title: "Loan Default Data"
+output: pdf_document
+---
+
+Aaron Matos
+
+```{r}
+library(rmarkdown)
+library(MASS)
+library(tidyverse)
+library(ISLR)
+library(kknn)
+
+
+loan_data <- readRDS(file = "/cloud/project/Final Project/loan_data.rds")
+
+#Create training and test data
+set.seed(314)
+train_index <- sample(1:nrow(loan_data), floor(0.7*nrow(loan_data)))
+
+# training
+loan_training <- loan_data[train_index, ]
+
+# test
+loan_test <- loan_data[-train_index, ]
+
+# Function for analyzing confusion matrices
+cf_matrix <- function(actual_vec, pred_prob_vec, positive_val, 
+                      cut_prob = 0.5, search_cut = FALSE) {
+  
+  if (search_cut == FALSE) {
+  actual <- actual_vec == positive_val; pred <- pred_prob_vec >= cut_prob
+  P <- sum(actual); N <- length(actual) - P; TP <- sum(actual & pred)
+  FN <- P - TP; TN <- sum(!(actual) & !(pred)); FP <- N - TN
+  
+  if (TP != 0) { Precision <- TP/(TP + FP); Recall <- TP/(TP + FN)
+                 F1 <- 2*((Precision*Recall)/(Precision + Recall))}
+  
+  if(TP == 0) { Precision = 0; Recall = 0; F1 = 0 }
+ 
+  model_results <- list(confusion_matrix = 
+    data.frame(metric = c("Correct", "Misclassified", "True Positive",
+                           "True Negative","False Negative", "False Positive"),
+               observations = c(TN + TP, FN + FP, TP, TN, FN, FP),
+               rate = c((TN + TP)/(N + P), (FN + FP)/(N + P), TP/P, TN/N, FN/P, FP/N),
+               pct_total_obs = c((TN + TP), (FN + FP), TP, TN, FN, FP)*(1/(N + P)),
+               stringsAsFactors = FALSE),
+    F1_summary = 
+    data.frame(metric = c("Precision", "Recall", "F1 Score"),
+               value = c(Precision, Recall, F1),
+               stringsAsFactors = FALSE))
+return(model_results) } 
+ 
+  if (search_cut == TRUE) {
+    optimal_cut = data.frame(cut_prob = seq(0,1, by = 0.05),
+                             correct_rate = NA, F1_score = NA,
+                             false_pos_rate = NA, false_neg_rate = NA)
+    
+    for (row in (1:nrow(optimal_cut))) {
+      actual <- actual_vec == positive_val 
+      pred <- pred_prob_vec >= optimal_cut$cut_prob[row]
+      P <- sum(actual); N <- length(actual) - P
+      TP <- sum(actual & pred); FN <- P - TP
+      TN <- sum(!(actual) & !(pred)); FP <- N - TN
+  
+      if (TP != 0) { Precision <- TP/(TP + FP); Recall <- TP/(TP + FN)
+          F1 <- 2*((Precision*Recall)/(Precision + Recall))}
+  
+      if(TP == 0) { Precision = 0; Recall = 0; F1 = 0 }
+      
+      optimal_cut[row, 2:5] <- c((TN + TP)/(N + P), F1, FP/N, FN/P)
+    } 
+return(optimal_cut)
+  }
+}
+
+```
+
+**Exploratory Data Analysis Section**
+
+Do loan default rates differ by customer age?
+
+Findings: Yes, customers between 35 and 50 years old have significantly lower default rates than other customers. Customer age appears to be a strong predictor of loan default.
+
+```{r}
+
+default_by_age <- loan_data %>% group_by(age_category) %>% 
+                  summarise(total_customers = n(),
+                            customers_who_defaulted = sum(loan_default == "Yes")) %>% 
+                  mutate(default_rate = customers_who_defaulted / total_customers)
+
+
+default_by_age
+
+
+ggplot(data = loan_data, mapping = aes(x = age_category, fill = loan_default)) +
+  geom_bar(position = "fill") +
+  labs(title = "Loan Default Rates by Customer Age Category",
+        x = "Customer Age",
+        y = "Proportion of Loan Default (Yes/No)") +
+  coord_flip()
+```
+
+Question 1:
+
+
+```{r}
+#Question1: Which applicant gender (female/ male) was more likely to default on their loan? 
+default_by_gender <- loan_data %>% 
+                  group_by(gender) %>%
+                  summarise(total_customers = n(),
+                            customers_defaulted = sum(loan_default == "Yes"))%>%
+                   mutate(default_rate = customers_defaulted / total_customers) %>%
+                    arrange(desc(default_rate))
+
+#Bar Chart 
+ggplot(data = loan_data, mapping = aes(x = gender, fill = loan_default)) + geom_bar(position = "fill") + labs(title = "Loan Default Rates by Customer Gender", x = "Gender", y = "Proportion of Loan Default (Yes/ No)")
+
+```
+Males have more than twice the default rate on loans than females with rates of 33.2% and 15.0% respectively.
+
+```{r}
+#Question2: Which education level is most likely to default in a loan?
+default_by_ed <- loan_data %>%
+                group_by(highest_ed_level) %>%
+                summarise(customers_defaulted = sum(loan_default == "Yes"), number_of_customers = n()) %>% 
+  mutate(percent_defaulted = customers_defaulted / number_of_customers) %>% 
+  arrange(desc(customers_defaulted))
+```
+It appears that individuals with less formal education default on their loans more frequently. Those with a high school level education showed a 61.6% default rate while < high school exhibited a 43.6% default rate.
+
+```{r}
+#Question3: What is the total amount of loan defaults by applicant region of residence?
+default_by_region <- loan_data %>% group_by(us_region_residence) %>%
+  summarise(number_of_customer = n(),
+    customers_defaulted = sum(loan_default == "Yes"),
+    default_rate = customers_defaulted / number_of_customer) 
+
+#Bar Chart 
+ggplot(data = loan_data, mapping = aes(x= us_region_residence, fill = loan_default)) +
+  geom_bar(stat = "count")+
+  labs(title = "Loan Defaults by Region of Residence", x = "Region of Residence", y = "Number of Loan Defaults")
+```
+It appears that those individuals living in the Northeast and Midwest have a significantly higher rate of default at 40.4% and 38.3% respectively.
+
+
+```{r}
+#Question4: What is the number of customers that defaulted on their loan based on their adjusted annual income category? 
+income <-loan_data %>% mutate(income_category = case_when(adjusted_annual_inc < 10000 ~ "Less than $10,000", between(adjusted_annual_inc, 10001, 49999) ~ "10,000 and 49,999", between(adjusted_annual_inc, 50000, 79999) ~ "50,000 and 79,999", between(adjusted_annual_inc, 80000, 99999) ~ "80000 and 99,999", adjusted_annual_inc >= 10000 ~ "100k and more")) %>% group_by(income_category) %>% summarise(customers_defaulted = sum(loan_default == "Yes"), number_of_customers = n(), default_rate = customers_defaulted / number_of_customers) %>% arrange(desc(customers_defaulted))
+
+```
+Apparent in the "income" data frame is the relationship between defaulting on loans and levels of income. Those making less than 10k/year showed a default rate of 38.5%. Individuals making 10-50k have a default rate of 25.9%.
+
+
+```{r}
+#Question5: What is the relationship between average total open accounts for an applicant and number of defaults?
+open_accounts <- loan_data %>%
+              group_by(open_acc) %>%
+              summarise(customer_defaulted = sum(loan_default == "Yes"),
+                        number_of_customers = n(), default_rate = number_of_customers / customer_defaulted,
+                        default_rate1 = ifelse(default_rate == "Inf", 0, default_rate)) %>% arrange(desc(open_acc))
+
+#Line Chart 
+ggplot(data = open_accounts, mapping = aes(y = default_rate1, x = open_acc)) + 
+  geom_line(color = "#0072B2") + 
+  geom_point(color = "#0072B2") +
+  geom_smooth(method = "lm", color = "#D55E00")+
+  labs(title = "Customer Default Rate by Total Open Accounts", x = "Open Accounts", y = "Default Rate")
+```
+The relationship between open accounts and default rates seems to be a negative one. As open accounts increase, default rates seem to decline. However this could be indicative of outliers in our data set or a lack of individuals with more than 28 open accounts. 
+
+
+```{r}
+#Question6: What is the relationship between public record bankruptcies and number of defaults?
+bankruptcies <- loan_data %>%
+              group_by(pub_rec_bankruptcies) %>%
+              summarise(customer_defaulted = sum(loan_default == "Yes"), 
+                        number_of_customers = n(),
+                        default_rate = customer_defaulted / number_of_customers)
+
+#Line Chart
+ggplot(data = bankruptcies, mapping = aes(y = default_rate, x = pub_rec_bankruptcies)) +
+  geom_line(color = "#0072B2") + 
+  geom_point(color = "#0072B2") +
+  geom_smooth(method = "lm", color = "#D55E00") +
+  labs(title = "Customer Default Rate by Total Public Bankruptcies", y = "Default Rate", x = "Public Record Bankruptcies")
+```
+Surprisingly the relationship between public bankruptcies and loan defaults is negative as well. Again, this could be due to the limited number of individuals in the data set with >= 2 bankruptcies. 
+
+```{r}
+#Question7: What is the average fico score of applicants who have/ have not defaulted on their loan?
+fico_score_defaults <- loan_data %>% 
+              mutate(fico_score_ranges = case_when(fico_score  <= 579 ~ "Poor", between(fico_score, 580, 669) ~ "Fair", between(fico_score, 670, 739) ~ "Good", fico_score >= 740 ~ "Exceptional")) %>% 
+  group_by(fico_score_ranges, loan_default) %>% 
+  summarise(average_fico = mean(fico_score)) %>% 
+  spread(key = fico_score_ranges, value = average_fico)
+```
+In our fico score defaults dataframe above, we see the average fico score for individuals in all four ranges, poor, fair, good, and exceptional, who did or did not default on their loans. There is no obvious difference in score between the two groups aside from the "Poor" fico score. Those who defaulted in the poor group had on average a 48 point lower fico score than their counterparts who did not default. 
+
+```{r}
+#Question8: What number of credit inquires per customer has the highest default rates?
+
+inq_defaults <- loan_data %>%
+              group_by(inq_last_6mths) %>%
+              summarise(number_of_customers = n(),
+                customer_defaulted = sum(loan_default == "Yes"), 
+                        customer_not_defaulted = sum(loan_default == "No"),
+                default_rate = customer_defaulted / number_of_customers)
+```
+It appears that customers with a greater amount of credit inquiries default at a higher rate.
+
+```{r}
+#Question9: What is the relationship between adjusted_ann_inc and dti as it relates to loan_default among customers less than 24 years old?
+
+less_than_24 <- loan_data %>% filter(age_category == "Less than 24")
+
+ggplot(data = less_than_24, 
+       mapping = aes(x = adjusted_annual_inc, y = dti, 
+                     color = loan_default)) + 
+    geom_point() + 
+    geom_smooth(method = "lm", se = FALSE) +
+      labs(title = "Adjusted Annual Income vs Debt to Income Ratio in Applicants < 24 Years Old \n",
+          x = "Adjusted Annual Income", y = "Debt to Income Ratio")
+            
+            
+
+```
+It does not appear that there is any relationship between annual adjusted income and dti as they relate to loan default rates in individuals under 24 years old. It is intuitive however, that those with a greater annual adjusted income with a lower dti would be at the very least, be slightly less likely to default. 
+
+
+
+
+**Variable Selection**
+
+**Mixed Variable Selection with Logistic Regression**
+
+```{r}
+#full model
+upper_loan_model <- glm(loan_default ~ .,
+                        data = loan_training,
+                        family = "binomial")
+
+#Null Model
+lower_loan_model <- glm(loan_default ~ 1,
+                        data = loan_training,
+                        family = "binomial")
+#mixed selection
+results_loan_mixed <- step(lower_loan_model,
+                           scope = list(lower = lower_loan_model, upper = upper_loan_model),
+                           direction = "both", trace = 0)
+
+summary(results_loan_mixed)
+
+optimal_loan_model <- glm(loan_default ~ fico_score + highest_ed_level + 
+    us_region_residence + age_category + gender + dti + bc_util + 
+    inq_last_6mths + adjusted_annual_inc + residence_property, 
+    family = "binomial", data = loan_training)
+
+summary(optimal_loan_model)
+
+
+
+```
+
+Above you can see our optimal loan model which is the result of a step wise search direction of "both". The optimal model produces an AIC score of 1564.7 while the upper model produces a score of 1570.8. The optimal model removes 5 of the 15 original variables to produce it's outcome. Due to the high P values associated with adjusted_annual_inc and residence_propertyOwn, we explored removing them from our optimal model. Removing them ultimately resulted in an increased AIC score which is indicative of a lesser quality model. 
+
+
+**Predictive Modeling**
+
+
+**Classification Method 1: Predicting loan_default**
+
+```{r}
+lda_loan_default <- lda(loan_default ~ ., 
+                        data = loan_training,
+                        CV =  FALSE)
+                  names(lda_loan_default)
+
+lda_pred_training <- predict(lda_loan_default, newdata = loan_training)
+
+lda_results_training <- data.frame(loan_training, lda_pred_0.5 = lda_pred_training$class, lda_pred_training$posterior)
+                  
+              
+cf_matrix(actual_vec = lda_results_training$loan_default, pred_prob_vec = lda_results_training$Yes, positive_val = "Yes", search_cut = TRUE)
+
+loandefaultlda <- cf_matrix(actual_vec = lda_results_training$loan_default, pred_prob_vec = lda_results_training$Yes, positive_val = "Yes", cut_prob = 0.25	)
+
+loandefaultlda
+
+#Analysis: In the training data, the model that had the default probability cut-off value of .5 had a F1 score of 0.6897196	in comparison to the optimal probability cut-off value of .25, which had a F1 score of 0.7190332. The model with the default probability had a false positive rate of 0.05278737 and false negative rate of 0.37878788. In comparison to the model with the optimal probability with a false positive rate of 0.09690958 and false negative rate of 0.04502098. The probability with the optimal cut-off of .25 is the model that the team will select to represent the data due to the higher F1 Score (which depicts the accuracy of the model due to the low false positives and false negatives). 
+
+lda_pred_test <- predict(lda_loan_default, newdata = loan_test)
+
+lda_results_test <- data.frame(loan_test, 
+                               lda_pred_0.5 = lda_pred_test$class, lda_pred_test$posterior)
+
+lda_results_test <- lda_results_test %>%
+                 mutate(lda_pred_0.25 = ifelse(Yes >= 0.25, "Yes", "No"))
+
+cf_matrix(actual_vec = lda_results_test$loan_default, pred_prob_vec = lda_results_test$Yes, positive_val = "Yes", cut_prob = 0.25)
+
+#Make Predictions : The test data in comparison to the training data had a weaker F1 score when using the optimal probability cut off. The test data has a F1 score of 0.6538462, false positive rate of 0.1113662, and false negative rate of 0.3280632. The test model was not as accurate as the training model due to the lower F1 value despite the lower false positive and higher false negative rates. The LDA algorithm was more accurate than the QDA algorithm but less accurate than the logistic regression model. 
+
+```
+
+
+
+**Classification Method 2: Predicting loan_default**
+
+```{r}
+qda_loan_default <- qda(loan_default ~ ., 
+                        data = loan_training,
+                        CV = FALSE)
+                  names(qda_loan_default)
+                  
+qda_pred_training <- predict(qda_loan_default, newdata = loan_training)
+
+qda_results_training <- data.frame(loan_training, qda_pred_0.5 = qda_pred_training$class, qda_pred_training$posterior)
+                  
+cf_matrix(actual_vec = qda_results_training$loan_default, pred_prob_vec = qda_results_training$Yes, positive_val = "Yes", search_cut = TRUE)
+
+loandefaultqda <- cf_matrix(actual_vec = qda_results_training$loan_default, pred_prob_vec = qda_results_training$Yes, positive_val = "Yes", cut_prob = 0.45)
+
+loandefaultqda
+
+#Analysis: In the training data, the model that had the default probability cut-off value of .5 had a F1 score of 0.6737160	in comparison to the optimal probability cut-off value of .45, which had a F1 score of 0.6745914. The model with the default probability had a false positive rate of 0.1401085	and false negative rate of 0.2491582. In comparison to the model with the optimal probability with a false positive rate of 0.1470153 and false negative rate of 0.2356902. The probability with the optimal cut-off of .45 is the model that the team will select to represent the data due to the higher F1 Score (which depicts the accuracy of the model due to the low false positives and false negatives). 
+
+qda_pred_test <- predict(qda_loan_default, newdata = loan_test)
+
+qda_results_test <- data.frame(loan_test, 
+                               qda_pred_0.5 = qda_pred_test$class, qda_pred_test$posterior)
+
+qda_results_test <- qda_results_test %>%
+                 mutate(qda_pred_0.45 = ifelse(Yes >= 0.45, "Yes", "No"))
+
+cf_matrix(actual_vec = qda_results_test$loan_default, pred_prob_vec = qda_results_test$Yes, positive_val = "Yes", cut_prob = 0.45)
+
+#Make Predictions: The test data in comparison to the training data had a weaker F1 score when using the optimal probability cut off. The test data has a F1 score of 0.5767790, false positive rate of 0.1458094, and false negative rate of 0.3913043. The test model was not as accurate as the training model due to the lower F1 value, and lower false positive and higher false negative rates. The QDA algorithm was the least accurate compared to the LDA algorithm and Logistic Regression model due to the smallest F1 value. 
+
+```
+
+
+**Classification Method 3: Predicting loan_default**
+
+```{r}
+logistic_fit <- glm(loan_default ~ ., 
+                    data = loan_training, 
+                    family = "binomial")
+
+logistics_results_training <- data.frame(loan_training, 
+                                         logistic_prob = predict(logistic_fit, newdata = loan_training, type = "response"))
+
+cf_matrix(actual_vec = logistics_results_training$loan_default, pred_prob_vec = logistics_results_training$logistic_prob, positive_val = "Yes")
+
+logisticreg <- cf_matrix(actual_vec = logistics_results_training$loan_default, pred_prob_vec = logistics_results_training$logistic_prob, positive_val = "Yes", cut_prob = 0.35)
+
+logisticreg
+
+#Analysis: In the training data, the model that had the default probability cut-off value of .5 had a F1 score of 	0.7002801	in comparison to the optimal probability cut-off value of .35, which had a F1 score of 0.7303922. The model with the default probability had a false positive rate of 0.05032067 and false negative rate of 0.36868687. In comparison to the model with the optimal probability with a false positive rate of 0.0902812 and false negative rate of 0.2474747. The probability with the optimal cut-off of .35 is the model that we will select to represent the data due to the higher F1 Score (which depicts the accuracy of the model due to the low false positives and false negatives). 
+
+logistic_results_test <- data.frame(loan_test, 
+                                    logistic_prob = predict(logistic_fit, newdata = loan_test, type = "response"))
+
+logistic_results_test <- logistic_results_test %>% mutate(logistic_pred_0.35 = ifelse(logistic_prob >= 0.35, "Yes", "No"))
+
+cf_matrix(actual_vec = logistic_results_test$loan_default, pred_prob_vec = logistic_results_test$logistic_prob, positive_val = "Yes", cut_prob = 0.35)
+
+#Make Predictions: The test data in comparison to the training data had a weaker F1 score when using the optimal probability cut off. The test data has a F1 score of 	0.6597938, false positive rate of 0.08266361, and false negative rate of 0.36758893. The test model was not as accurate as the training model due to the lower F1 value, and lower false positive and higher false negative rates. The Logistic Regression Model was more accurate than the LDA and QDA algorithms due to its large F1 value. 
+```
+
+**BONUS KNN CLASSIFICATION METHOD**
+```{r}
+
+train.kknn(loan_default ~ .,
+          data = loan_training,
+          kmax = 40)
+
+#Best K = 26
+
+knn_loandefault_training <- kknn(loan_default ~ ., train = loan_training,
+                                 test= loan_training,
+                                 k = 26, distance = 2)
+
+knn_loanresults_training <- data.frame(loan_training,
+                                   knn_pred_0.5 = knn_loandefault_training$fitted.values,
+                                   knn_loandefault_training$prob)
+
+cf_matrix(actual_vec = knn_loanresults_training$loan_default,
+          pred_prob_vec = knn_loanresults_training$Yes,
+          positive_val = "Yes",
+          search_cut = TRUE)
+
+```
+
+```{r}
+#test
+
+knn_loandefault_test <- kknn(loan_default ~ ., train = loan_training,
+                                 test= loan_test,
+                                 k = 26, distance = 2)
+
+knn_loanresult_test <- data.frame(loan_test,
+                               knn_pred_0.5 = knn_loandefault_test$fitted.values,
+                               knn_loandefault_test$prob)
+
+knn_results_test <- knn_loanresult_test %>% 
+                    mutate(knn_pred_0.3 = ifelse(Yes >= 0.3, "Yes", "No"))
+
+cf_matrix(actual_vec = knn_loanresult_test$loan_default,
+          pred_prob_vec = knn_loanresult_test$Yes,
+          positive_val = "Yes",
+          cut_prob = .3)
+
+
+```
+
+
+**Summary of Findings and Recommendations**
+
+  Through our exploratory analysis we discovered a number of relations relating to loan default rates. First we started with gender and discovered that males have more than twice the default rate on loans than females with rates of 33.2% and 15.0% respectively. Next, it appears that individuals with less formal education default on their loans more frequently. Those with a high school level education showed a 61.6% default rate while < high school exhibited a 43.6% default rate. Region seemed to play a role as well. Individuals living in the Northeast and Midwest have a significantly higher rate of default at 40.4% and 38.3% respectively. Apparent in our "income" data frame is the relationship between defaulting on loans and levels of income. Those making less than 10k/year showed a default rate of 38.5%. Individuals making 10-50k have a default rate of 25.9%. It appears that customers with a greater amount of credit inquiries default at a higher rate.
+  The relationship between open accounts and default rates seems to be a negative one. As open accounts increase, default rates seem to decline. However this could be indicative of outliers in our data set or a lack of individuals with more than 28 open accounts. Surprisingly the relationship between public bankruptcies and loan defaults is negative as well. Again, this could be due to the limited number of individuals in the data set with >= 2 bankruptcies. In our fico score defaults dataframe above, we see the average fico score for individuals in all four ranges, poor, fair, good, and exceptional, who did or did not default on their loans. There is no obvious difference in score between the two groups aside from the "Poor" fico score. Those who defaulted in the poor group had on average a 48 point lower fico score than their counterparts who did not default. It does not appear that there is any relationship between annual adjusted income and dti as they relate to loan default rates in individuals under 24 years old. It is intuitive however, that those with a greater annual adjusted income with a lower dti would at the very least, be slightly less likely to default. 
+  
+  Above, in our variable selection with logistic regression, you can see our optimal loan model which is the result of a step wise search direction of "both". The optimal model produces an AIC score of 1564.7 while the upper model produces a score of 1570.8. The optimal model removes 5 of the 15 original variables to produce it's outcome. Due to the high P values associated with adjusted_annual_inc and residence_propertyOwn, we explored removing them from our optimal model. Removing them ultimately resulted in an increased AIC score which is indicative of a lesser quality model.
+
+  Next we attempted to tackle predicitive modeling by fitting linear, quadratic, logistic, and knn models on training data. Ultimately two of the models prevailed when run against our test data. They are the linear discriminant analysis and logistic regression models. The models both posted impressive F1 scores with our lda model at 65.38 and our glm model at 65.98. However, despite the greater F1 score of our glm model, we recommend using our lda model. The lda model posted a 32.81 false negative rate as opposed to the 36.76 false negative rate of our glm model. In this case, a false negative would be predicting that someone would not default on their loan, when actually they did. We as a nation witnessed the possible consequences of sub-prime loans and the damage they can do to our global economy. For that reason it is imperative that lenders place priority on avoiding these false negative outcomes. We recommend that lenders account for all of the variables included in our optimal model when considering lending money to potential borrowers. 
